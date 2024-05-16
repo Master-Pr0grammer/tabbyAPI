@@ -1,5 +1,8 @@
 # TabbyAPI
 
+
+STARTUP: `c:/GitHub/tabbyAPI/venv/Scripts/python.exe c:/GitHub/tabbyAPI/main.py` - run command in terminal at tabbyapi directory
+
 > [!IMPORTANT]
 >
 >  In addition to the README, please read the [Wiki](https://github.com/theroyallab/tabbyAPI/wiki/1.-Getting-Started) page for information about getting started!

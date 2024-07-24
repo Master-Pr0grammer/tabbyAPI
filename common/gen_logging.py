@@ -51,11 +51,13 @@ def log_generation_params(**kwargs):
         logger.info(f"Generation options: {kwargs}\n")
 
 
-def log_prompt(prompt: str, negative_prompt: Optional[str]):
+def log_prompt(prompt: str, request_id: str, negative_prompt: Optional[str]):
     """Logs the prompt to console."""
     if PREFERENCES.prompt:
         formatted_prompt = "\n" + prompt
-        logger.info(f"Prompt: {formatted_prompt if prompt else 'Empty'}\n")
+        logger.info(
+            f"Prompt (ID: {request_id}): {formatted_prompt if prompt else 'Empty'}\n"
+        )
 
         if negative_prompt:
             formatted_negative_prompt = "\n" + negative_prompt
@@ -70,29 +72,44 @@ def log_response(response: str):
 
 
 def log_metrics(
+    queue_time: float,
+    prompt_tokens: int,
+    cached_tokens: int,
+    prompt_time: float,
     generated_tokens: int,
-    elapsed_time: float,
+    generate_time: float,
     context_len: Optional[int],
     max_seq_len: int,
 ):
     initial_response = (
         f"Metrics: {generated_tokens} tokens generated in "
-        f"{round(elapsed_time, 2)} seconds"
+        f"{round(queue_time + prompt_time + generate_time, 2)} seconds"
     )
     itemization = []
     extra_parts = []
 
-    # Add tokens per second
-    tokens_per_second = (
+    itemization.append(f"Queue: {round(queue_time, 2)} s")
+
+    prompt_ts = (
         "Indeterminate"
-        if elapsed_time == 0
-        else round(generated_tokens / elapsed_time, 2)
+        if prompt_time == 0
+        else round((prompt_tokens - cached_tokens) / prompt_time, 2)
     )
-    itemization.append(f"{tokens_per_second} T/s")
+    itemization.append(
+        f"Process: {cached_tokens} cached tokens and "
+        f"{prompt_tokens - cached_tokens} new tokens at {prompt_ts} T/s"
+    )
+
+    generate_ts = (
+        "Indeterminate"
+        if generate_time == 0
+        else round(generated_tokens / generate_time, 2)
+    )
+    itemization.append(f"Generate: {generate_ts} T/s")
 
     # Add context (original token count)
     if context_len:
-        itemization.append(f"context {context_len} tokens")
+        itemization.append(f"Context: {context_len} tokens")
 
         if context_len > max_seq_len:
             extra_parts.append("<-- Not accurate (truncated)")

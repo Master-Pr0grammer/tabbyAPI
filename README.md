@@ -1,7 +1,26 @@
 # TabbyAPI
 
+<p align="left">
+    <img src="https://img.shields.io/badge/Python-3.10%20|%203.11%20|%203.12-blue" alt="Python 3.10, 3.11, and 3.12">
+    <a href="/LICENSE">
+        <img src="https://img.shields.io/badge/License-AGPLv3-blue.svg" alt="License: AGPL v3"/>
+    </a>
+    <a href="https://discord.gg/sYQxnuD7Fj">
+        <img src="https://img.shields.io/discord/545740643247456267.svg?logo=discord&color=blue" alt="Discord Server"/>
+    </a>
+</p>
 
-STARTUP: `c:/GitHub/tabbyAPI/venv/Scripts/python.exe c:/GitHub/tabbyAPI/main.py` - run command in terminal at tabbyapi directory
+<p align="left">
+    <a href="https://theroyallab.github.io/tabbyAPI">
+        <img src="https://img.shields.io/badge/Documentation-API-orange" alt="Developer facing API documentation">
+    </a>
+</p>
+
+<p align="left">
+    <a href="https://ko-fi.com/I2I3BDTSW">
+        <img src="https://img.shields.io/badge/Support_on_Ko--fi-FF5E5B?logo=ko-fi&style=for-the-badge&logoColor=white" alt="Support on Ko-Fi">
+    </a>
+</p>
 
 > [!IMPORTANT]
 >
@@ -37,15 +56,17 @@ TabbyAPI uses Exllamav2 as a powerful and fast backend for model inference, load
 
 - FP16 (using Exllamav2's loader)
 
+In addition, TabbyAPI supports parallel batching using paged attention for Nvidia Ampere GPUs and higher.
+
 #### Alternative Loaders/Backends
 
 If you want to use a different model type or quantization method than the ones listed above, here are some alternative backends with their own APIs:
 
 - GGUF + GGML - [KoboldCPP](https://github.com/lostruins/KoboldCPP)
 
-- Production ready + Many other quants + batching [Aphrodite Engine](https://github.com/PygmalionAI/Aphrodite-engine)
+- Production ready + Many other quants + batching - [Aphrodite Engine](https://github.com/PygmalionAI/Aphrodite-engine)
 
-- Production ready + batching [VLLM](https://github.com/vllm-project/vllm)
+- Production ready + batching - [VLLM](https://github.com/vllm-project/vllm)
 
 - [Text Generation WebUI](https://github.com/oobabooga/text-generation-webui)
 

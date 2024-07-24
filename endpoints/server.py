@@ -3,26 +3,61 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
+from common import config
 from common.logger import UVICORN_LOG_CONFIG
+from common.networking import get_global_depends
+from common.utils import unwrap
+from endpoints.core.router import router as CoreRouter
 from endpoints.OAI.router import router as OAIRouter
 
-app = FastAPI(
-    title="TabbyAPI",
-    summary="An OAI compatible exllamav2 API that's both lightweight and fast",
-    description=(
-        "This docs page is not meant to send requests! Please use a service "
-        "like Postman or a frontend UI."
-    ),
-)
 
-# ALlow CORS requests
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def setup_app():
+    """Includes the correct routers for startup"""
+
+    app = FastAPI(
+        title="TabbyAPI",
+        summary="An OAI compatible exllamav2 API that's both lightweight and fast",
+        description=(
+            "This docs page is not meant to send requests! Please use a service "
+            "like Postman or a frontend UI."
+        ),
+        dependencies=get_global_depends(),
+    )
+
+    # ALlow CORS requests
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    api_servers = unwrap(config.network_config().get("api_servers"), [])
+
+    # Map for API id to server router
+    router_mapping = {"oai": OAIRouter}
+
+    # Include the OAI api by default
+    if api_servers:
+        for server in api_servers:
+            server_name = server.lower()
+            if server_name in router_mapping:
+                app.include_router(router_mapping[server_name])
+    else:
+        app.include_router(OAIRouter)
+
+    # Include core API request paths
+    app.include_router(CoreRouter)
+
+    return app
+
+
+def export_openapi():
+    """Function to return the OpenAPI JSON from the API server"""
+
+    app = setup_app()
+    return app.openapi()
 
 
 async def start_api(host: str, port: int):
@@ -33,8 +68,8 @@ async def start_api(host: str, port: int):
     logger.info(f"Completions: http://{host}:{port}/v1/completions")
     logger.info(f"Chat completions: http://{host}:{port}/v1/chat/completions")
 
-    # Add OAI router
-    app.include_router(OAIRouter)
+    # Setup app
+    app = setup_app()
 
     config = uvicorn.Config(
         app,

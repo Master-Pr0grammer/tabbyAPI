@@ -1,13 +1,14 @@
 """The main tabbyAPI module. Contains the FastAPI server and endpoints."""
 
 import asyncio
+import aiofiles
+import json
 import os
 import pathlib
 import signal
 from loguru import logger
 from typing import Optional
 
-from backends.exllamav2.utils import check_exllama_version
 from common import config, gen_logging, sampling, model
 from common.args import convert_args_to_dict, init_argparser
 from common.auth import load_auth_keys
@@ -15,7 +16,11 @@ from common.logger import setup_logger
 from common.networking import is_port_in_use
 from common.signals import signal_handler
 from common.utils import unwrap
-from endpoints.server import start_api
+from endpoints.server import export_openapi, start_api
+from endpoints.utils import do_export_openapi
+
+if not do_export_openapi:
+    from backends.exllamav2.utils import check_exllama_version
 
 
 async def entrypoint(args: Optional[dict] = None):
@@ -26,6 +31,15 @@ async def entrypoint(args: Optional[dict] = None):
     # Set up signal aborting
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    if os.getenv("EXPORT_OPENAPI", "").lower() in ("true", "1"):
+        openapi_json = export_openapi()
+
+        async with aiofiles.open("openapi.json", "w") as f:
+            await f.write(json.dumps(openapi_json))
+            logger.info("Successfully wrote OpenAPI spec to openapi.json")
+
+        return
 
     # Load from YAML config
     config.from_file(pathlib.Path("config.yml"))
@@ -83,7 +97,7 @@ async def entrypoint(args: Optional[dict] = None):
     load_auth_keys(unwrap(network_config.get("disable_auth"), False))
 
     # Override the generation log options if given
-    log_config = config.gen_logging_config()
+    log_config = config.logging_config()
     if log_config:
         gen_logging.update_from_dict(log_config)
 

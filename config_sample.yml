@@ -19,6 +19,14 @@ network:
   # Turn on this option if you are ONLY connecting from localhost
   disable_auth: False
 
+  # Send tracebacks over the API to clients (default: False)
+  # NOTE: Only enable this for debug purposes
+  send_tracebacks: False
+
+  # Select API servers to enable (default: ["OAI"])
+  # Possible values: OAI
+  api_servers: ["OAI"]
+
 # Options for logging
 logging:
   # Enable prompt logging (default: False)
@@ -26,6 +34,10 @@ logging:
 
   # Enable generation parameter logging (default: False)
   generation_params: False
+
+  # Enable request logging (default: False)
+  # NOTE: Only use this for debugging!
+  requests: False
 
 # Options for sampling
 sampling:
@@ -51,19 +63,29 @@ developer:
   #cuda_malloc_backend: False
 
 # Options for model overrides and loading
+# Please read the comments to understand how arguments are handled between initial and API loads
 model:
   # Overrides the directory to look for models (default: models)
   # Windows users, DO NOT put this path in quotes! This directory will be invalid otherwise.
   model_dir: models
+
+  # Sends dummy model names when the models endpoint is queried
+  # Enable this if the program is looking for a specific OAI model
+  #use_dummy_models: False
 
   # An initial model to load. Make sure the model is located in the model directory!
   # A model can be loaded later via the API.
   # REQUIRED: This must be filled out to load a model on startup!
   model_name:
 
-  # Sends dummy model names when the models endpoint is queried
-  # Enable this if the program is looking for a specific OAI model
-  #use_dummy_models: False
+  # The below parameters only apply for initial loads
+  # All API based loads do NOT inherit these settings unless specified in use_as_default
+
+  # Names of args to use as a default fallback for API load requests (default: [])
+  # For example, if you always want cache_mode to be Q4 instead of on the inital model load,
+  # Add "cache_mode" to this array
+  # Ex. ["max_seq_len", "cache_mode"]
+  #use_as_default: []
 
   # The below parameters apply only if model_name is set
 
@@ -100,16 +122,25 @@ model:
   # Leave blank to automatically calculate alpha
   #rope_alpha: 1.0
 
-  # Disable Flash-attention 2. Set to True for GPUs lower than Nvidia's 3000 series. (default: False)
-  #no_flash_attention: False
-
   # Enable different cache modes for VRAM savings (slight performance hit).
-  # Possible values FP16, FP8, Q4. (default: FP16)
+  # Possible values FP16, Q8, Q6, Q4. (default: FP16)
   #cache_mode: FP16
+
+  # Size of the prompt cache to allocate (default: max_seq_len)
+  # This must be a multiple of 256. A larger cache uses more VRAM, but allows for more prompts to be processed at once.
+  # NOTE: Cache size should not be less than max_seq_len.
+  # For CFG, set this to 2 * max_seq_len to make room for both positive and negative prompts.
+  #cache_size:
 
   # Chunk size for prompt ingestion. A lower value reduces VRAM usage at the cost of ingestion speed (default: 2048)
   # NOTE: Effects vary depending on the model. An ideal value is between 512 and 4096
   #chunk_size: 2048
+
+  # Set the maximum amount of prompts to process at one time (batch)
+  # This will be automatically adjusted depending on the cache size.
+  # A max batch size of 1 processes prompts one at a time.
+  # NOTE: Only available for Nvidia ampere (30 series) and above GPUs
+  #max_batch_size: 20
 
   # Set the prompt template for this model. If empty, attempts to look for the model's chat template. (default: None)
   # If a model contains multiple templates in its tokenizer_config.json, set prompt_template to the name
@@ -121,10 +152,6 @@ model:
   # WARNING: Don't set this unless you know what you're doing!
   # NOTE: For MoE models (ex. Mixtral) only!
   #num_experts_per_token:
-
-  # Enables CFG support (default: False)
-  # WARNING: This flag disables Flash Attention! (a stopgap fix until it's fixed in upstream)
-  #use_cfg: False
 
   # Enables fasttensors to possibly increase model loading speeds (default: False)
   #fasttensors: true
@@ -138,6 +165,9 @@ model:
     # A draft model can be loaded later via the API.
     #draft_model_name: A model name
   
+    # The below parameters only apply for initial loads
+    # All API based loads do NOT inherit these settings unless specified in use_as_default
+
     # Rope scale for draft models (default: 1.0)
     # Same thing as compress_pos_emb
     # Only use if your draft model was trained on long context with rope (check config.json)
@@ -147,6 +177,10 @@ model:
     # Same thing as alpha_value
     # Leave blank to automatically calculate alpha value
     #draft_rope_alpha: 1.0
+
+    # Enable different draft model cache modes for VRAM savings (slight performance hit).
+    # Possible values FP16, Q8, Q6, Q4. (default: FP16)
+    #draft_cache_mode: FP16
   
   # Options for loras
   #lora:

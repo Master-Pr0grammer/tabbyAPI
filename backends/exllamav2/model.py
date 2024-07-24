@@ -1,28 +1,40 @@
 """The model container class for ExLlamaV2 models."""
 
+import asyncio
 import gc
 import math
 import pathlib
-import threading
-import time
 import traceback
-
 import torch
+import uuid
 from exllamav2 import (
     ExLlamaV2,
     ExLlamaV2Config,
     ExLlamaV2Cache,
-    ExLlamaV2Cache_8bit,
     ExLlamaV2Cache_Q4,
+    ExLlamaV2Cache_Q6,
+    ExLlamaV2Cache_Q8,
     ExLlamaV2Tokenizer,
     ExLlamaV2Lora,
 )
-from exllamav2.generator import ExLlamaV2StreamingGenerator, ExLlamaV2Sampler
+from exllamav2.generator import (
+    ExLlamaV2Sampler,
+    ExLlamaV2DynamicGeneratorAsync,
+    ExLlamaV2DynamicJobAsync,
+)
 from itertools import zip_longest
 from loguru import logger
 from typing import List, Optional, Union
 
-from backends.exllamav2.grammar import ExLlamaV2Grammar
+from backends.exllamav2.grammar import (
+    ExLlamaV2Grammar,
+    clear_grammar_func_cache,
+)
+from backends.exllamav2.utils import (
+    exllama_disabled_flash_attn,
+    hardware_supports_flash_attn,
+    supports_paged_attn,
+)
 from common.concurrency import iterate_in_threadpool
 from common.gen_logging import (
     log_generation_params,
@@ -50,13 +62,15 @@ class ExllamaV2Container:
     cache: Optional[ExLlamaV2Cache] = None
     draft_cache: Optional[ExLlamaV2Cache] = None
     tokenizer: Optional[ExLlamaV2Tokenizer] = None
-    generator: Optional[ExLlamaV2StreamingGenerator] = None
+    generator: Optional[ExLlamaV2DynamicGeneratorAsync] = None
     prompt_template: Optional[PromptTemplate] = None
-    active_loras: List[ExLlamaV2Lora] = []
+    paged: bool = True
 
     # Internal config vars
+    cache_size: int = None
     cache_mode: str = "FP16"
-    use_cfg: bool = False
+    draft_cache_mode: str = "FP16"
+    max_batch_size: int = 20
     generation_config: Optional[GenerationConfig] = None
 
     # GPU split vars
@@ -67,6 +81,12 @@ class ExllamaV2Container:
     # Load state
     model_is_loading: bool = False
     model_loaded: bool = False
+
+    # Load synchronization
+    # The lock keeps load tasks sequential
+    # The condition notifies any waiting tasks
+    load_lock: asyncio.Lock = asyncio.Lock()
+    load_condition: asyncio.Condition = asyncio.Condition()
 
     def __init__(self, model_directory: pathlib.Path, quiet=False, **kwargs):
         """
@@ -81,10 +101,12 @@ class ExllamaV2Container:
                 def progress(loaded_modules: int, total_modules: int,
                              loading_draft: bool)
             **kwargs:
-                `cache_mode` (str): Sets cache mode, "FP16" or "FP8"
-                    (defaulf: "FP16")
+                `cache_mode` (str): Sets cache mode: "FP16"/"Q8"/"Q6"/"Q4"
+                    (default: "FP16")
                 'max_seq_len' (int): Override model's default max sequence
                     length (default: 4096)
+                'cache_size' (int): Num of tokens to allocate space for in the k/v cache
+                    (default: max_seq_len)
                 'rope_scale' (float): Set RoPE scaling factor for model
                     (default: 1.0)
                 'rope_alpha' (float): Set RoPE alpha (NTK) factor for model
@@ -104,6 +126,8 @@ class ExllamaV2Container:
                     model. By default, the draft model's alpha value is
                     calculated automatically to scale to the size of the
                     full model.
+                'draft_cache_mode' (str): Sets draft cache mode: "FP16"/"Q8"/"Q6"/"Q4"
+                    (default: "FP16")
                 'lora_dir' (str): LoRA directory
                 'loras' (list[dict]): List of loras to be loaded, consisting of
                     'name' and 'scaling'
@@ -111,10 +135,6 @@ class ExllamaV2Container:
                     available devices (default: True)
                 'gpu_split' (list[float]): Allocation for weights and (some)
                     tensors, per device
-                'no_flash_attn' (bool): Turns off flash attention
-                    (increases vram usage) (default: False)
-                'use_cfg" (bool): Enables CFG support. Disables flash attention
-                    (default: False)
         """
 
         self.quiet = quiet
@@ -123,22 +143,26 @@ class ExllamaV2Container:
         # Turn off GPU split if the user is using 1 GPU
         gpu_count = torch.cuda.device_count()
         gpu_split_auto = unwrap(kwargs.get("gpu_split_auto"), True)
+        gpu_device_list = list(range(0, gpu_count))
 
         if gpu_count > 1 and gpu_split_auto:
             # Auto GPU split parameters
             self.gpu_split_auto = gpu_split_auto
 
             autosplit_reserve_megabytes = unwrap(kwargs.get("autosplit_reserve"), [96])
-            self.autosplit_reserve = list(
-                map(
-                    lambda value: int(math.ceil(value * 1024**2)),
-                    autosplit_reserve_megabytes,
-                )
-            )
+            self.autosplit_reserve = [
+                int(math.ceil(value * 1024**2)) for value in autosplit_reserve_megabytes
+            ]
         elif gpu_count > 1:
             # Manual GPU split
             self.gpu_split = kwargs.get("gpu_split")
             self.gpu_split_auto = False
+
+            gpu_device_list = [
+                device_idx
+                for device_idx, memory in enumerate(self.gpu_split)
+                if memory > 0
+            ]
         else:
             # One GPU setup
             self.gpu_split_auto = False
@@ -155,6 +179,12 @@ class ExllamaV2Container:
         self.config.max_output_len = 16
 
         self.config.prepare()
+
+        # Check if the model arch is compatible with various exl2 features
+        try:
+            self.config.arch_compat_overrides()
+        except AttributeError:
+            pass
 
         # Then override the base_seq_len if present
         override_base_seq_len = kwargs.get("override_base_seq_len")
@@ -180,17 +210,63 @@ class ExllamaV2Container:
             kwargs.get("rope_alpha"), self.calculate_rope_alpha(base_seq_len)
         )
 
-        # Enable CFG if present
-        self.use_cfg = unwrap(kwargs.get("use_cfg"), False)
-
         # Enable fasttensors loading if present
         self.config.fasttensors = unwrap(kwargs.get("fasttensors"), False)
 
-        # Turn off flash attention if CFG is on
-        # Workaround until batched FA2 is fixed in exllamav2 upstream
-        self.config.no_flash_attn = (
-            True if self.use_cfg else unwrap(kwargs.get("no_flash_attention"), False)
-        )
+        # Check whether the user's configuration supports flash/paged attention
+        # Also check if exl2 has disabled flash attention
+        if (
+            exllama_disabled_flash_attn(self.config.no_flash_attn)
+            or not hardware_supports_flash_attn(gpu_device_list)
+            or not supports_paged_attn()
+        ):
+            self.config.no_flash_attn = True
+            self.paged = False
+            self.max_batch_size = 1
+            torch.backends.cuda.enable_flash_sdp(False)
+
+        # Set k/v cache size
+        # cache_size is only relevant when paged mode is enabled
+        if self.paged:
+            cache_size = unwrap(kwargs.get("cache_size"), self.config.max_seq_len)
+
+            if cache_size < self.config.max_seq_len:
+                logger.warning(
+                    f"The given cache_size ({cache_size}) is smaller than the "
+                    "desired context length.\n"
+                    "Overriding cache_size to max_seq_len. "
+                )
+
+                cache_size = self.config.max_seq_len
+
+            # Enforce a multiple of 256 for cache size
+            # Overestimate to ensure that the cache isn't below max_seq_len
+            cache_remainder = cache_size % 256
+            if cache_remainder != 0:
+                rounded_cache_size = int(
+                    256 * ((cache_size - cache_remainder) / 256 + 1)
+                )
+
+                logger.warning(
+                    f"The given cache size ({cache_size}) is "
+                    "not a multiple of 256.\n"
+                    "Overriding cache_size with an overestimated value of "
+                    f"{rounded_cache_size} tokens."
+                )
+
+                cache_size = rounded_cache_size
+
+            # Warn user if cache size may be inadequate for CFG
+            if cache_size < 2 * self.config.max_seq_len:
+                logger.warning(
+                    f"The given cache_size ({cache_size}) is less than 2 * max_seq_len "
+                    "and may be too small for requests using CFG. \n"
+                    "Ignore this warning if you do not plan on using CFG."
+                )
+
+            self.cache_size = cache_size
+        else:
+            self.cache_size = self.config.max_seq_len
 
         # Try to set prompt template
         self.prompt_template = self.find_prompt_template(
@@ -248,6 +324,7 @@ class ExllamaV2Container:
 
         if enable_draft:
             self.draft_config = ExLlamaV2Config()
+            self.draft_config.no_flash_attn = self.config.no_flash_attn
             draft_model_path = pathlib.Path(
                 unwrap(draft_args.get("draft_model_dir"), "models")
             )
@@ -266,6 +343,7 @@ class ExllamaV2Container:
                 self.calculate_rope_alpha(self.draft_config.max_seq_len),
             )
             self.draft_config.max_seq_len = self.config.max_seq_len
+            self.draft_cache_mode = unwrap(draft_args.get("draft_cache_mode"), "FP16")
 
             if chunk_size:
                 self.draft_config.max_input_len = chunk_size
@@ -327,6 +405,9 @@ class ExllamaV2Container:
     def get_model_path(self, is_draft: bool = False):
         """Get the path for this model."""
 
+        if is_draft and not self.draft_config:
+            return None
+
         model_path = pathlib.Path(
             self.draft_config.model_dir if is_draft else self.config.model_dir
         )
@@ -338,10 +419,10 @@ class ExllamaV2Container:
             "rope_scale": self.config.scale_pos_emb,
             "rope_alpha": self.config.scale_alpha_value,
             "max_seq_len": self.config.max_seq_len,
+            "cache_size": self.cache_size,
             "cache_mode": self.cache_mode,
             "chunk_size": self.config.max_input_len,
             "num_experts_per_token": self.config.num_experts_per_token,
-            "use_cfg": self.use_cfg,
             "prompt_template": self.prompt_template.name
             if self.prompt_template
             else None,
@@ -353,11 +434,33 @@ class ExllamaV2Container:
                 "rope_scale": self.draft_config.scale_pos_emb,
                 "rope_alpha": self.draft_config.scale_alpha_value,
                 "max_seq_len": self.draft_config.max_seq_len,
+                "cache_mode": self.draft_cache_mode,
             }
 
             model_params["draft"] = draft_model_params
 
         return model_params
+
+    async def wait_for_jobs(self, skip_wait: bool = False):
+        """Polling mechanism to wait for pending generation jobs."""
+
+        if not self.generator:
+            return
+
+        # Immediately abort all jobs if asked
+        if skip_wait:
+            logger.warning(
+                "Immediately terminating all jobs. "
+                "Clients will have their requests cancelled.\n"
+            )
+
+            # Requires a copy to avoid errors during iteration
+            jobs_copy = self.generator.jobs.copy()
+            for job in jobs_copy.values():
+                await job.cancel()
+
+        while self.generator.jobs:
+            await asyncio.sleep(0.01)
 
     async def load(self, progress_callback=None):
         """
@@ -372,48 +475,43 @@ class ExllamaV2Container:
         async for _ in self.load_gen(progress_callback):
             pass
 
-    async def load_loras(self, lora_directory: pathlib.Path, **kwargs):
-        """
-        Load loras
-        """
+    async def load_gen(self, progress_callback=None, **kwargs):
+        """Loads a model and streams progress via a generator."""
 
-        loras = unwrap(kwargs.get("loras"), [])
-        success: List[str] = []
-        failure: List[str] = []
+        # Indicate that model load has started
+        # Do this operation under the load lock's context
+        try:
+            await self.load_lock.acquire()
+            self.model_is_loading = True
 
-        for lora in loras:
-            lora_name = lora.get("name")
-            lora_scaling = unwrap(lora.get("scaling"), 1.0)
+            # Wait for existing generation jobs to finish
+            await self.wait_for_jobs(kwargs.get("skip_wait"))
 
-            if lora_name is None:
-                logger.warning(
-                    "One of your loras does not have a name. Please check your "
-                    "config.yml! Skipping lora load."
-                )
-                failure.append(lora_name)
-                continue
+            # Streaming gen for model load progress
+            model_load_generator = self.load_model_sync(progress_callback)
+            async for value in iterate_in_threadpool(model_load_generator):
+                yield value
 
-            logger.info(f"Loading lora: {lora_name} at scaling {lora_scaling}")
-            lora_path = lora_directory / lora_name
+            # Create async generator
+            await self.create_generator()
 
-            self.active_loras.append(
-                ExLlamaV2Lora.from_directory(self.model, lora_path, lora_scaling)
-            )
-            logger.info(f"Lora successfully loaded: {lora_name}")
-            success.append(lora_name)
+            # Clean up any extra vram usage from torch and cuda
+            # (Helps reduce VRAM bottlenecking on Windows)
+            gc.collect()
+            torch.cuda.empty_cache()
 
-        # Return success and failure names
-        return {"success": success, "failure": failure}
+            # Cleanup and update model load state
+            self.model_loaded = True
+            logger.info("Model successfully loaded.")
+        finally:
+            self.load_lock.release()
+            self.model_is_loading = False
 
-    async def load_gen(self, progress_callback=None):
-        """Basic async wrapper around the loading generator"""
-
-        load_generator = self.load_gen_sync(progress_callback)
-        async for value in iterate_in_threadpool(load_generator):
-            yield value
+            async with self.load_condition:
+                self.load_condition.notify_all()
 
     @torch.inference_mode()
-    def load_gen_sync(self, progress_callback=None):
+    def load_model_sync(self, progress_callback=None):
         """
         Load model, generator function
 
@@ -424,9 +522,6 @@ class ExllamaV2Container:
 
         Runs under a shared inference mode context.
         """
-
-        # Notify that the model is being loaded
-        self.model_is_loading = True
 
         # Reset tokenizer namespace vars and create a tokenizer
         ExLlamaV2Tokenizer.unspecial_piece_to_id = {}
@@ -448,7 +543,30 @@ class ExllamaV2Container:
             if not self.quiet:
                 logger.info("Loading draft model: " + self.draft_config.model_dir)
 
-            self.draft_cache = ExLlamaV2Cache(self.draft_model, lazy=True)
+            if self.draft_cache_mode == "Q4":
+                self.draft_cache = ExLlamaV2Cache_Q4(
+                    self.draft_model,
+                    max_seq_len=self.cache_size,
+                    lazy=True,
+                )
+            elif self.draft_cache_mode == "Q6":
+                self.draft_cache = ExLlamaV2Cache_Q6(
+                    self.draft_model,
+                    max_seq_len=self.cache_size,
+                    lazy=True,
+                )
+            elif self.draft_cache_mode == "Q8":
+                self.draft_cache = ExLlamaV2Cache_Q8(
+                    self.draft_model,
+                    max_seq_len=self.cache_size,
+                    lazy=True,
+                )
+            else:
+                self.draft_cache = ExLlamaV2Cache(
+                    self.draft_model,
+                    max_seq_len=self.cache_size,
+                    lazy=True,
+                )
             for value in self.draft_model.load_autosplit_gen(
                 self.draft_cache,
                 reserve_vram=autosplit_reserve,
@@ -478,19 +596,33 @@ class ExllamaV2Container:
                 if value:
                     yield value
 
-        batch_size = 2 if self.use_cfg else 1
-
         if self.cache_mode == "Q4":
             self.cache = ExLlamaV2Cache_Q4(
-                self.model, lazy=self.gpu_split_auto, batch_size=batch_size
+                self.model,
+                max_seq_len=self.cache_size,
+                lazy=self.gpu_split_auto,
+                batch_size=1,
             )
-        elif self.cache_mode == "FP8":
-            self.cache = ExLlamaV2Cache_8bit(
-                self.model, lazy=self.gpu_split_auto, batch_size=batch_size
+        elif self.cache_mode == "Q6":
+            self.cache = ExLlamaV2Cache_Q6(
+                self.model,
+                max_seq_len=self.cache_size,
+                lazy=self.gpu_split_auto,
+                batch_size=1,
+            )
+        elif self.cache_mode == "Q8":
+            self.cache = ExLlamaV2Cache_Q8(
+                self.model,
+                max_seq_len=self.cache_size,
+                lazy=self.gpu_split_auto,
+                batch_size=1,
             )
         else:
             self.cache = ExLlamaV2Cache(
-                self.model, lazy=self.gpu_split_auto, batch_size=batch_size
+                self.model,
+                max_seq_len=self.cache_size,
+                lazy=self.gpu_split_auto,
+                batch_size=1,
             )
 
         # Load model with autosplit
@@ -510,58 +642,141 @@ class ExllamaV2Container:
         input_ids = torch.zeros((1, self.config.max_input_len), dtype=torch.long)
         self.model.forward(input_ids, cache=self.cache, preprocess_only=True)
 
-        # Create generator
-        self.generator = ExLlamaV2StreamingGenerator(
-            self.model,
-            self.cache,
-            self.tokenizer,
-            self.draft_model,
-            self.draft_cache,
-        )
+    async def create_generator(self):
+        try:
+            # Don't acquire locks unless a model is loaded
+            if self.model_loaded:
+                await self.load_lock.acquire()
 
-        # Clean up any extra vram usage from torch and cuda
-        # (Helps reduce VRAM bottlenecking on Windows)
-        gc.collect()
-        torch.cuda.empty_cache()
+                # Immediately cancel all jobs
+                await self.wait_for_jobs(skip_wait=True)
 
-        # Update model load state
-        self.model_is_loading = False
-        self.model_loaded = True
-        logger.info("Model successfully loaded.")
+            # Create new generator
+            self.generator = ExLlamaV2DynamicGeneratorAsync(
+                model=self.model,
+                cache=self.cache,
+                draft_model=self.draft_model,
+                draft_cache=self.draft_cache,
+                tokenizer=self.tokenizer,
+                max_batch_size=self.max_batch_size,
+                paged=self.paged,
+            )
+        finally:
+            # This means the generator is being recreated
+            # The load lock is already released in the load function
+            if self.model_loaded:
+                self.load_lock.release()
 
-    def unload(self, loras_only: bool = False):
+                async with self.load_condition:
+                    self.load_condition.notify_all()
+
+    def get_loras(self):
+        """Convenience function to get all loras."""
+
+        return unwrap(self.generator.generator.current_loras, [])
+
+    async def load_loras(self, lora_directory: pathlib.Path, **kwargs):
+        """
+        Load loras
+        """
+
+        loras = unwrap(kwargs.get("loras"), [])
+
+        try:
+            await self.load_lock.acquire()
+
+            # Wait for existing generation jobs to finish
+            await self.wait_for_jobs(kwargs.get("skip_wait"))
+
+            loras_to_load: List[ExLlamaV2Lora] = []
+            success: List[str] = []
+            failure: List[str] = []
+
+            for lora in loras:
+                lora_name = lora.get("name")
+                lora_scaling = unwrap(lora.get("scaling"), 1.0)
+
+                if lora_name is None:
+                    logger.warning(
+                        "One of your loras does not have a name. Please check your "
+                        "config.yml! Skipping lora load."
+                    )
+                    failure.append(lora_name)
+                    continue
+
+                logger.info(f"Adding lora: {lora_name} at scaling {lora_scaling}")
+                lora_path = lora_directory / lora_name
+
+                loras_to_load.append(
+                    ExLlamaV2Lora.from_directory(self.model, lora_path, lora_scaling)
+                )
+                logger.info(f"Lora successfully added: {lora_name}")
+                success.append(lora_name)
+
+            self.generator.generator.set_loras(loras_to_load)
+            logger.info("All loras successfully loaded")
+
+            # Return success and failure names
+            return {"success": success, "failure": failure}
+        finally:
+            self.load_lock.release()
+
+            async with self.load_condition:
+                self.load_condition.notify_all()
+
+    async def unload(self, loras_only: bool = False, **kwargs):
         """
         Free all VRAM resources used by this model
         """
 
-        for lora in self.active_loras:
-            lora.unload()
+        try:
+            await self.load_lock.acquire()
 
-        self.active_loras = []
+            # Wait for other jobs to finish
+            await self.wait_for_jobs(kwargs.get("skip_wait"))
 
-        # Unload the entire model if not just unloading loras
-        if not loras_only:
-            if self.model:
-                self.model.unload()
-            self.model = None
+            # Delete references held in the grammar module
+            clear_grammar_func_cache()
 
-            if self.draft_model:
-                self.draft_model.unload()
-            self.draft_model = None
+            # Unload LoRAs
+            if self.generator and self.generator.generator.current_loras:
+                for lora in self.generator.generator.current_loras:
+                    lora.unload()
 
-            self.config = None
-            self.cache = None
-            self.tokenizer = None
-            self.generator = None
+                self.generator.generator.set_loras([])
 
-            # Set all model state variables to False
-            self.model_is_loading = False
-            self.model_loaded = False
+            # Unload the entire model if not just unloading loras
+            if not loras_only:
+                if self.model:
+                    self.model.unload()
+                self.model = None
 
-        gc.collect()
-        torch.cuda.empty_cache()
+                if self.draft_model:
+                    self.draft_model.unload()
+                self.draft_model = None
 
-        logger.info("Loras unloaded." if loras_only else "Model unloaded.")
+                self.config = None
+                self.cache = None
+                self.tokenizer = None
+
+                # Cleanup the generator from any pending jobs
+                if self.generator is not None:
+                    await self.generator.close()
+                    self.generator = None
+
+                # Set all model state variables to False
+                self.model_is_loading = False
+                self.model_loaded = False
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            logger.info("Loras unloaded." if loras_only else "Model unloaded.")
+        finally:
+            self.load_lock.release()
+
+            async with self.load_condition:
+                self.load_condition.notify_all()
 
     def encode_tokens(self, text: str, **kwargs):
         """Wrapper to encode tokens from a text string"""
@@ -597,28 +812,26 @@ class ExllamaV2Container:
         }
 
     def get_logprobs(self, token_ids: torch.Tensor, token_probs: torch.Tensor):
-        top_tokens = list(
-            map(
-                lambda index: self.tokenizer.extended_id_to_piece.get(
-                    index, self.tokenizer.id_to_piece[index]
-                ),
-                token_ids.flatten().tolist(),
+        top_tokens = [
+            self.tokenizer.extended_id_to_piece.get(
+                index, self.tokenizer.id_to_piece[index]
             )
-        )
+            for index in token_ids.flatten().tolist()
+        ]
 
         top_values = torch.log(token_probs).flatten().tolist()
 
         # Cannot return -inf in JSON
-        cleaned_values = list(
-            map(lambda value: -1000 if value == float("-inf") else value, top_values)
-        )
+        cleaned_values = [
+            -1000 if value == float("-inf") else value for value in top_values
+        ]
 
         return dict(zip_longest(top_tokens, cleaned_values))
 
-    async def generate(self, prompt: str, **kwargs):
+    async def generate(self, prompt: str, request_id: str, **kwargs):
         """Generate a response to a prompt"""
         generations = []
-        async for generation in self.generate_gen(prompt, **kwargs):
+        async for generation in self.generate_gen(prompt, request_id, **kwargs):
             generations.append(generation)
 
         joined_generation = {
@@ -668,17 +881,11 @@ class ExllamaV2Container:
         return kwargs
 
     async def generate_gen(
-        self, prompt: str, abort_event: Optional[threading.Event] = None, **kwargs
-    ):
-        """Basic async wrapper for completion generator"""
-
-        sync_generator = self.generate_gen_sync(prompt, abort_event, **kwargs)
-        async for value in iterate_in_threadpool(sync_generator):
-            yield value
-
-    @torch.inference_mode()
-    def generate_gen_sync(
-        self, prompt: str, abort_event: Optional[threading.Event] = None, **kwargs
+        self,
+        prompt: str,
+        request_id: str,
+        abort_event: Optional[asyncio.Event] = None,
+        **kwargs,
     ):
         """
         Create generator function for prompt completion.
@@ -686,8 +893,13 @@ class ExllamaV2Container:
         for kwargs, check common/sampling.py
         """
 
+        # Wait for load lock to be freed before processing
+        async with self.load_condition:
+            await self.load_condition.wait_for(lambda: not self.load_lock.locked())
+
+        prompts = [prompt]
+
         token_healing = unwrap(kwargs.get("token_healing"), False)
-        stream_interval = unwrap(kwargs.get("stream_interval"), 0)
         generate_window = max(
             unwrap(kwargs.get("generate_window"), 512), self.config.max_seq_len // 8
         )
@@ -742,17 +954,19 @@ class ExllamaV2Container:
         cfg_scale = unwrap(kwargs.get("cfg_scale"), 1.0)
         negative_prompt = None
         if cfg_scale not in [None, 1.0]:
-            if self.use_cfg:
+            if self.paged:
                 gen_settings.cfg_scale = cfg_scale
 
                 # If the negative prompt is empty, use the BOS token
                 negative_prompt = unwrap(
                     kwargs.get("negative_prompt"), self.tokenizer.bos_token
                 )
+
+                prompts.append(negative_prompt)
             else:
                 logger.warning(
-                    "CFG is currently disabled. "
-                    "Please reload your model with use_cfg = True.",
+                    "CFG is currently disabled because paged mode is disabled. "
+                    "Please use an ampere (30 series) or higher GPU for CFG support."
                 )
 
         gen_settings.token_repetition_penalty = unwrap(
@@ -841,28 +1055,23 @@ class ExllamaV2Container:
 
         # Initialize grammar handler
         grammar_handler = ExLlamaV2Grammar()
-        gen_settings.filters = []
 
         # Add JSON schema filter if it exists
         json_schema = unwrap(kwargs.get("json_schema"))
         if json_schema:
             grammar_handler.add_json_schema_filter(
-                json_schema, gen_settings, self.model, self.tokenizer
+                json_schema, self.model, self.tokenizer
             )
 
         # Add regex filter if it exists
         regex_pattern = unwrap(kwargs.get("regex_pattern"))
         if regex_pattern:
-            grammar_handler.add_regex_filter(
-                regex_pattern, gen_settings, self.tokenizer
-            )
+            grammar_handler.add_regex_filter(regex_pattern, self.tokenizer)
 
         # Add EBNF filter if it exists
         grammar_string = unwrap(kwargs.get("grammar_string"))
         if grammar_string:
-            grammar_handler.add_ebnf_filter(
-                grammar_string, gen_settings, self.model, self.tokenizer
-            )
+            grammar_handler.add_ebnf_filter(grammar_string, self.model, self.tokenizer)
 
         # Fetch EOS tokens from generation_config if they exist
         eos_tokens = (
@@ -879,25 +1088,16 @@ class ExllamaV2Container:
         else:
             stop_conditions += eos_tokens
 
-        # Stop conditions
-        self.generator.set_stop_conditions(stop_conditions)
+        # Encode both positive and negative prompts
+        input_ids = [
+            self.tokenizer.encode(
+                prompt, add_bos=add_bos_token, encode_special_tokens=True
+            )
+            for prompt in prompts
+        ]
 
-        # Tokenized context
-        ids, offsets = self.tokenizer.encode(
-            [prompt, negative_prompt]
-            if negative_prompt and gen_settings.cfg_scale not in [None, 1.0]
-            else prompt,
-            add_bos=add_bos_token,
-            encode_special_tokens=True,
-            return_offsets=True,
-        )
-        mask = (
-            self.tokenizer.padding_mask(ids)
-            if self.use_cfg and gen_settings.cfg_scale not in [None, 1.0]
-            else None
-        )
-        context_len = len(ids[0])
-
+        # The first index will always be the positive prompt
+        context_len = input_ids[0].size(dim=-1)
         if context_len > self.config.max_seq_len:
             logger.warning(
                 f"Context length {context_len} is greater than max_seq_len "
@@ -905,12 +1105,10 @@ class ExllamaV2Container:
                 "metrics may not be accurate."
             )
 
-        prompt_tokens = ids.shape[-1]
-
         # Automatically set max_tokens to fill up the context
         # This should be an OK default, but may be changed in the future
         max_tokens = unwrap(
-            kwargs.get("max_tokens"), self.config.max_seq_len - prompt_tokens
+            kwargs.get("max_tokens"), self.config.max_seq_len - context_len
         )
 
         # Set min_tokens to generate while keeping EOS banned
@@ -919,28 +1117,10 @@ class ExllamaV2Container:
         # This is an inverse of skip_special_tokens
         decode_special_tokens = unwrap(not kwargs.get("skip_special_tokens"), False)
 
-        begin_stream_args = {
-            "token_healing": token_healing,
-            "loras": self.active_loras,
-            "return_probabilities": request_logprobs > 0,
-            "return_top_tokens": request_logprobs,
-            "return_logits": request_logprobs > 0,
-            "abort_event": abort_event,
-            "banned_strings": banned_strings,
-            "decode_special_tokens": decode_special_tokens,
-        }
-
-        if self.use_cfg:
-            begin_stream_args.update(
-                {
-                    "input_mask": mask,
-                    "position_offsets": offsets,
-                }
-            )
-
         # Log generation options to console
         # Some options are too large, so log the args instead
         log_generation_params(
+            request_id=request_id,
             max_tokens=max_tokens,
             min_tokens=min_tokens,
             stream=kwargs.get("stream"),
@@ -959,121 +1139,129 @@ class ExllamaV2Container:
             banned_tokens=banned_tokens,
             banned_strings=banned_strings,
             logit_bias=logit_bias,
+            filters=grammar_handler.filters,
         )
 
         # Log prompt to console
-        log_prompt(prompt, negative_prompt)
+        log_prompt(prompt, request_id, negative_prompt)
 
-        # Begin
+        # Create and add a new job
+        # Don't use the request ID here as there can be multiple jobs per request
+        job_id = uuid.uuid4().hex
+        job = ExLlamaV2DynamicJobAsync(
+            self.generator,
+            input_ids=input_ids,
+            max_new_tokens=max_tokens,
+            min_new_tokens=min_tokens,
+            gen_settings=gen_settings,
+            stop_conditions=stop_conditions,
+            decode_special_tokens=decode_special_tokens,
+            filters=grammar_handler.filters,
+            filter_prefer_eos=bool(grammar_handler.filters),
+            return_probs=request_logprobs > 0,
+            return_top_tokens=request_logprobs,
+            return_logits=request_logprobs > 0,
+            banned_strings=banned_strings,
+            token_healing=token_healing,
+            identifier=job_id,
+        )
+
+        # Save generated tokens and full response
+        # Copy over max seq len incase model is unloaded and stored jobs can complete
+        # Full response is required for offset calculation
+        max_seq_len = self.config.max_seq_len
         generated_tokens = 0
         full_response = ""
-        start_time = time.time()
-        last_chunk_time = start_time
 
-        save_tokens = torch.empty((ids.shape[0], 0), dtype=torch.bool)
-        chunk_buffer = ""
-        chunk_tokens = 0
+        # Get the generation status once it's ready
+        try:
+            async for result in job:
+                # Abort if the event is set while streaming
+                if abort_event and abort_event.is_set():
+                    await job.cancel()
+                    break
 
-        while True:
-            # Ingest prompt
-            if chunk_tokens == 0:
-                ids = torch.cat((ids, save_tokens), dim=-1)
-                save_tokens = torch.empty((ids.shape[0], 0), dtype=torch.bool)
-                overflow = ids.shape[-1] + generate_window - self.config.max_seq_len
-                active_ids = ids[:, max(0, overflow) :]
-                chunk_tokens = self.config.max_seq_len - active_ids.shape[-1]
+                stage = result.get("stage")
+                result_id = result.get("identifier")
 
-                # Kick off the streaming generation
-                self.generator.begin_stream_ex(
-                    active_ids, gen_settings, **begin_stream_args
-                )
+                if stage == "streaming" and result_id == job_id:
+                    chunk = unwrap(result.get("text"), "")
+                    full_response += chunk
 
-                # Reset offsets for subsequent passes if the context is truncated
-                offsets = None
+                    chunk_tokens = result.get("token_ids")
+                    if chunk_tokens is not None:
+                        generated_tokens += chunk_tokens.size(dim=0)
 
-            if auto_scale_penalty_range:
-                gen_settings.token_repetition_range = generated_tokens
+                    generation = {
+                        "text": chunk,
+                        "prompt_tokens": context_len,
+                        "generated_tokens": generated_tokens,
+                        "offset": len(full_response),
+                    }
 
-            # Run dict generation
-            # Guarantees return of chunk, eos, and chunk_token_ids
-            if generated_tokens < min_tokens:
-                raw_generation = self.generator.stream_ex(ban_tokens=eos_tokens)
-            else:
-                raw_generation = self.generator.stream_ex()
+                    if request_logprobs > 0:
+                        # Get top tokens and probs
+                        top_tokens = unwrap(
+                            result.get("top_k_tokens"),
+                            torch.empty((1, 0, 1), dtype=torch.long),
+                        )
 
-            if token_healing:
-                # Extract healed token
-                ids[:, -1] = self.generator.sequence_ids[:, -2]
-                token_healing = False
+                        top_probs = unwrap(
+                            result.get("top_k_probs"),
+                            torch.empty((1, 0, 1), dtype=torch.float),
+                        )
 
-            # Get parameters that will always exist
-            chunk = raw_generation["chunk"]
-            eos = raw_generation["eos"]
-            tokens = raw_generation["chunk_token_ids"]
+                        if top_tokens.numel() > 0 and top_probs.numel() > 0:
+                            logprobs = self.get_logprobs(top_tokens, top_probs)
+                            generation["logprobs"] = logprobs
 
-            save_tokens = torch.cat(
-                (save_tokens, tokens.expand(save_tokens.shape[0], -1)), dim=-1
-            )
-            chunk_buffer += chunk
+                            # The first logprob is the selected token prob
+                            generation["token_probs"] = {
+                                token: logprobs[token]
+                                for token in list(logprobs.keys())[:1]
+                            }
 
-            generated_tokens += 1
-            chunk_tokens -= 1
+                    yield generation
 
-            # Yield output
-            now = time.time()
-            elapsed = now - last_chunk_time
+                    # Second yield if eos is true
+                    if result.get("eos"):
+                        log_response(full_response)
 
-            if chunk_buffer != "" and (
-                elapsed > stream_interval or eos or generated_tokens == max_tokens
-            ):
-                generation = {
-                    "text": chunk_buffer,
-                    "prompt_tokens": prompt_tokens,
-                    "generated_tokens": generated_tokens,
-                    "offset": len(full_response),
-                }
+                        eos_reason = result.get("eos_reason")
+                        finish_reason = (
+                            "length" if eos_reason == "max_new_tokens" else "stop"
+                        )
 
-                if request_logprobs > 0:
-                    # Get top tokens and probs
-                    top_tokens = unwrap(
-                        raw_generation.get("top_tokens"),
-                        torch.empty((1, 0, 1), dtype=torch.long),
-                    )
+                        log_metrics(
+                            result.get("time_enqueued"),
+                            result.get("prompt_tokens"),
+                            result.get("cached_tokens"),
+                            result.get("time_prefill"),
+                            result.get("new_tokens"),
+                            result.get("time_generate"),
+                            context_len,
+                            max_seq_len,
+                        )
 
-                    top_probs = unwrap(
-                        raw_generation.get("top_probs"),
-                        torch.empty((1, 0, 1), dtype=torch.float),
-                    )
-
-                    if top_tokens.numel() > 0 and top_probs.numel() > 0:
-                        logprobs = self.get_logprobs(top_tokens, top_probs)
-                        generation["logprobs"] = logprobs
-
-                        # The first logprob is the selected token prob
-                        generation["token_probs"] = {
-                            token: logprobs[token]
-                            for token in list(logprobs.keys())[:1]
+                        # Remove the token text
+                        generation = {
+                            "prompt_tokens": generation.get("prompt_tokens"),
+                            "generated_tokens": generation.get("generated_tokens"),
+                            "finish_reason": finish_reason,
                         }
 
-                yield generation
-                full_response += chunk_buffer
-                chunk_buffer = ""
-                last_chunk_time = now
+                        yield generation
+                        break
+        except asyncio.CancelledError:
+            await job.cancel()
+        except Exception as ex:
+            # Create a new generator since the current state is broken
+            # No need to wait for this to finish
+            logger.error(
+                "FATAL ERROR with generation. "
+                "Attempting to recreate the generator. "
+                "If this fails, please restart the server.\n"
+            )
+            asyncio.ensure_future(self.create_generator())
 
-            if eos or generated_tokens == max_tokens:
-                # Print response
-                log_response(full_response)
-
-                # Print metrics
-                elapsed_time = last_chunk_time - start_time
-                context_len = None if ids is None else context_len
-
-                log_metrics(
-                    generated_tokens, elapsed_time, context_len, self.config.max_seq_len
-                )
-
-                finish_reason = "length" if generated_tokens == max_tokens else "stop"
-                generation = {"finish_reason": finish_reason}
-                yield generation
-
-                break
+            raise ex

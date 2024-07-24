@@ -41,7 +41,8 @@ class ChatCompletionStreamChoice(BaseModel):
 class ChatCompletionRequest(CommonCompletionRequest):
     # Messages
     # Take in a string as well even though it's not part of the OAI spec
-    messages: Union[str, List[Dict[str, str]]]
+    # support messages.content as a list of dict
+    messages: Union[str, List[Dict[str, Union[str, List[Dict[str, str]]]]]]
     prompt_template: Optional[str] = None
     add_generation_prompt: Optional[bool] = True
     template_vars: Optional[dict] = {}
@@ -63,3 +64,4 @@ class ChatCompletionStreamChunk(BaseModel):
     created: int = Field(default_factory=lambda: int(time()))
     model: str
     object: str = "chat.completion.chunk"
+    usage: Optional[UsageStats] = None

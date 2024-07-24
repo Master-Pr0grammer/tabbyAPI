@@ -1,12 +1,12 @@
 """Chat completion utilities for OAI server."""
 
-from asyncio import CancelledError
+import asyncio
 import pathlib
-import threading
-from typing import Optional
-from uuid import uuid4
+from asyncio import CancelledError
+from copy import deepcopy
+from typing import List, Optional
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from jinja2 import TemplateError
 from loguru import logger
 
@@ -15,6 +15,7 @@ from common.networking import (
     get_generator_error,
     handle_request_disconnect,
     handle_request_error,
+    request_disconnect_loop,
 )
 from common.utils import unwrap
 from endpoints.OAI.types.chat_completion import (
@@ -28,49 +29,58 @@ from endpoints.OAI.types.chat_completion import (
     ChatCompletionStreamChoice,
 )
 from endpoints.OAI.types.common import UsageStats
+from endpoints.OAI.utils.completion import _stream_collector
 
 
-def _create_response(generation: dict, model_name: Optional[str]):
+def _create_response(
+    request_id: str, generations: List[dict], model_name: Optional[str]
+):
     """Create a chat completion response from the provided text."""
 
-    message = ChatCompletionMessage(
-        role="assistant", content=unwrap(generation.get("text"), "")
-    )
+    prompt_tokens = unwrap(generations[-1].get("prompt_tokens"), 0)
+    completion_tokens = unwrap(generations[-1].get("generated_tokens"), 0)
 
-    logprob_response = None
+    choices = []
+    for index, generation in enumerate(generations):
+        message = ChatCompletionMessage(
+            role="assistant", content=unwrap(generation.get("text"), "")
+        )
 
-    token_probs = unwrap(generation.get("token_probs"), {})
-    if token_probs:
-        logprobs = unwrap(generation.get("logprobs"), [])
+        logprob_response = None
 
-        collected_token_probs = []
-        for index, token in enumerate(token_probs.keys()):
-            top_logprobs = [
-                ChatCompletionLogprob(token=token, logprob=logprob)
-                for token, logprob in logprobs[index].items()
-            ]
+        token_probs = unwrap(generation.get("token_probs"), {})
+        if token_probs:
+            logprobs = unwrap(generation.get("logprobs"), [])
 
-            collected_token_probs.append(
-                ChatCompletionLogprob(
-                    token=token,
-                    logprob=token_probs[token],
-                    top_logprobs=top_logprobs,
+            collected_token_probs = []
+            for index, token in enumerate(token_probs.keys()):
+                top_logprobs = [
+                    ChatCompletionLogprob(token=token, logprob=logprob)
+                    for token, logprob in logprobs[index].items()
+                ]
+
+                collected_token_probs.append(
+                    ChatCompletionLogprob(
+                        token=token,
+                        logprob=token_probs[token],
+                        top_logprobs=top_logprobs,
+                    )
                 )
-            )
 
-        logprob_response = ChatCompletionLogprobs(content=collected_token_probs)
+            logprob_response = ChatCompletionLogprobs(content=collected_token_probs)
 
-    choice = ChatCompletionRespChoice(
-        finish_reason=generation.get("finish_reason"),
-        message=message,
-        logprobs=logprob_response,
-    )
+        choice = ChatCompletionRespChoice(
+            index=index,
+            finish_reason=generation.get("finish_reason"),
+            message=message,
+            logprobs=logprob_response,
+        )
 
-    prompt_tokens = unwrap(generation.get("prompt_tokens"), 0)
-    completion_tokens = unwrap(generation.get("generated_tokens"), 0)
+        choices.append(choice)
 
     response = ChatCompletionResponse(
-        choices=[choice],
+        id=f"chatcmpl-{request_id}",
+        choices=choices,
         model=unwrap(model_name, ""),
         usage=UsageStats(
             prompt_tokens=prompt_tokens,
@@ -83,22 +93,39 @@ def _create_response(generation: dict, model_name: Optional[str]):
 
 
 def _create_stream_chunk(
-    const_id: str,
+    request_id: str,
     generation: Optional[dict] = None,
     model_name: Optional[str] = None,
+    is_usage_chunk: bool = False,
 ):
     """Create a chat completion stream chunk from the provided text."""
 
-    logprob_response = None
+    index = generation.get("index")
+    choices = []
+    usage_stats = None
 
-    if "finish_reason" in generation:
-        choice = ChatCompletionStreamChoice(
-            finish_reason=generation.get("finish_reason")
+    if is_usage_chunk:
+        prompt_tokens = unwrap(generation.get("prompt_tokens"), 0)
+        completion_tokens = unwrap(generation.get("generated_tokens"), 0)
+
+        usage_stats = UsageStats(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
         )
+    elif "finish_reason" in generation:
+        choice = ChatCompletionStreamChoice(
+            index=index,
+            finish_reason=generation.get("finish_reason"),
+        )
+
+        choices.append(choice)
     else:
         message = ChatCompletionMessage(
             role="assistant", content=unwrap(generation.get("text"), "")
         )
+
+        logprob_response = None
 
         token_probs = unwrap(generation.get("token_probs"), {})
         if token_probs:
@@ -118,12 +145,18 @@ def _create_stream_chunk(
             logprob_response = ChatCompletionLogprobs(content=[token_prob_response])
 
         choice = ChatCompletionStreamChoice(
+            index=index,
             delta=message,
             logprobs=logprob_response,
         )
 
+        choices.append(choice)
+
     chunk = ChatCompletionStreamChunk(
-        id=const_id, choices=[choice], model=unwrap(model_name, "")
+        id=f"chatcmpl-{request_id}",
+        choices=choices,
+        model=unwrap(model_name, ""),
+        usage=usage_stats,
     )
 
     return chunk
@@ -140,6 +173,19 @@ def format_prompt_with_template(data: ChatCompletionRequest):
             unwrap(data.add_bos_token, True),
             unwrap(data.ban_eos_token, False),
         )
+
+        # Deal with list in messages.content
+        # Just replace the content list with the very first text message
+        for message in data.messages:
+            if message["role"] == "user" and isinstance(message["content"], list):
+                message["content"] = next(
+                    (
+                        content["text"]
+                        for content in message["content"]
+                        if content["type"] == "text"
+                    ),
+                    "",
+                )
 
         # Overwrite any protected vars with their values
         data.template_vars.update(
@@ -193,29 +239,81 @@ def format_prompt_with_template(data: ChatCompletionRequest):
 
 
 async def stream_generate_chat_completion(
-    prompt: str, data: ChatCompletionRequest, model_path: pathlib.Path
+    prompt: str, data: ChatCompletionRequest, request: Request, model_path: pathlib.Path
 ):
     """Generator for the generation process."""
+    abort_event = asyncio.Event()
+    gen_queue = asyncio.Queue()
+    gen_tasks: List[asyncio.Task] = []
+    disconnect_task = asyncio.create_task(request_disconnect_loop(request))
+
     try:
-        const_id = f"chatcmpl-{uuid4().hex}"
-        abort_event = threading.Event()
+        logger.info(f"Recieved chat completion streaming request {request.state.id}")
 
-        new_generation = model.container.generate_gen(
-            prompt, abort_event, **data.to_gen_params()
-        )
-        async for generation in new_generation:
-            response = _create_stream_chunk(const_id, generation, model_path.name)
+        gen_params = data.to_gen_params()
 
+        for n in range(0, data.n):
+            if n > 0:
+                task_gen_params = deepcopy(gen_params)
+            else:
+                task_gen_params = gen_params
+
+            gen_task = asyncio.create_task(
+                _stream_collector(
+                    n,
+                    gen_queue,
+                    prompt,
+                    request.state.id,
+                    abort_event,
+                    **task_gen_params,
+                )
+            )
+
+            gen_tasks.append(gen_task)
+
+        # Consumer loop
+        while True:
+            if disconnect_task.done():
+                abort_event.set()
+                handle_request_disconnect(
+                    f"Chat completion generation {request.state.id} cancelled by user."
+                )
+
+            generation = await gen_queue.get()
+
+            # Stream collector will push an exception to the queue if it fails
+            if isinstance(generation, Exception):
+                raise generation
+
+            response = _create_stream_chunk(
+                request.state.id, generation, model_path.name
+            )
             yield response.model_dump_json()
 
-            # Break if the generation is finished
-            if "finish_reason" in generation:
+            # Check if all tasks are completed
+            if all(task.done() for task in gen_tasks) and gen_queue.empty():
+                # Send a usage chunk
+                if data.stream_options and data.stream_options.include_usage:
+                    usage_chunk = _create_stream_chunk(
+                        request.state.id,
+                        generation,
+                        model_path.name,
+                        is_usage_chunk=True,
+                    )
+                    yield usage_chunk.model_dump_json()
+
+                logger.info(
+                    f"Finished chat completion streaming request {request.state.id}"
+                )
+
+                yield "[DONE]"
                 break
     except CancelledError:
         # Get out if the request gets disconnected
 
-        abort_event.set()
-        handle_request_disconnect("Chat completion generation cancelled by user.")
+        if not disconnect_task.done():
+            abort_event.set()
+            handle_request_disconnect("Chat completion generation cancelled by user.")
     except Exception:
         yield get_generator_error(
             "Chat completion aborted. Please check the server console."
@@ -223,19 +321,38 @@ async def stream_generate_chat_completion(
 
 
 async def generate_chat_completion(
-    prompt: str, data: ChatCompletionRequest, model_path: pathlib.Path
+    prompt: str, data: ChatCompletionRequest, request: Request, model_path: pathlib.Path
 ):
+    gen_tasks: List[asyncio.Task] = []
+    gen_params = data.to_gen_params()
+
     try:
-        generation = await model.container.generate(
-            prompt,
-            **data.to_gen_params(),
-        )
-        response = _create_response(generation, model_path.name)
+        for n in range(0, data.n):
+            # Deepcopy gen params above the first index
+            # to ensure nested structures aren't shared
+            if n > 0:
+                task_gen_params = deepcopy(gen_params)
+            else:
+                task_gen_params = gen_params
+
+            gen_tasks.append(
+                asyncio.create_task(
+                    model.container.generate(
+                        prompt, request.state.id, **task_gen_params
+                    )
+                )
+            )
+
+        generations = await asyncio.gather(*gen_tasks)
+        response = _create_response(request.state.id, generations, model_path.name)
+
+        logger.info(f"Finished chat completion request {request.state.id}")
 
         return response
     except Exception as exc:
         error_message = handle_request_error(
-            "Chat completion aborted. Maybe the model was unloaded? "
+            f"Chat completion {request.state.id} aborted. "
+            "Maybe the model was unloaded? "
             "Please check the server console."
         ).error.message
 
